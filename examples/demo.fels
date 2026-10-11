@@ -1,9 +1,30 @@
+// A small table in a database file next to the program: each run adds a row and lists them.
 #import std.io;
 #import sqlite;
 
 main :: fn() -> i32 {
-    io::print("seconds since boot: ");
-    io::print_u64(sqlite::seconds_since_boot());
-    io::println("");
+    db := sqlite::open("demo.db") catch err {
+        io::println("cannot open demo.db");
+        return 1;
+    };
+    db.exec("CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY, at TEXT NOT NULL DEFAULT (datetime('now')));
+             INSERT INTO runs DEFAULT VALUES;") catch err {
+        io::println(db.message());
+        return 2;
+    };
+    st := db.prepare("SELECT id, at FROM runs ORDER BY id;") catch err {
+        io::println(db.message());
+        return 3;
+    };
+    io::print("SQLite ");
+    io::println(sqlite::version());
+    while st.step() ?? false {
+        io::print("  run ");
+        io::print_i64(st.int(0));
+        io::print(" at ");
+        io::println(st.text(1));
+    }
+    st.finish();
+    db.close();
     return 0;
 }
