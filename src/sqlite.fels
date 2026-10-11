@@ -1,33 +1,235 @@
-// sqlite: Fels bindings to a C library.
+// sqlite: Fels bindings to SQLite 3.
 //
-// A binding names the library and the C function, and gives its Fels type:
+//   db := sqlite::open("portfolio.db") catch err { return 1; };
+//   db.exec("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL);") catch err { return 2; };
+//   st := db.prepare("INSERT INTO notes (text) VALUES (?1);") catch err { return 3; };
+//   st.bind_text(1, "hello") catch err { return 4; };
+//   done := st.step() catch err { return 5; };
+//   st.finish();
+//   db.close();
 //
-//     #extern("sqlite", "sqlite_init")
-//     pub init :: fn(flags: u32) -> i32;
-//
-// That links sqlite.lib from lib/ (see lib/README.md). The two bindings below call
-// kernel32, which every Windows program links, so the package builds and its tests run
-// before your library is there. Replace them with your library's functions.
+// A statement's parameters count from 1 (`?1`), its result columns from 0, as in SQLite. Text
+// a statement returns is valid until its next `step`, `reset` or `finish`. The SQLite library
+// is in lib/ (see lib/README.md); `build.fels` gives it to the programs that use this package.
 
-#extern("kernel32", "GetTickCount64")
-pub ticks_ms :: fn() -> u64;
-
-#extern("kernel32", "GetCurrentProcessId")
-pub process_id :: fn() -> u32;
-
-// A Fels function over a binding: the place for nicer types and checks.
-pub seconds_since_boot :: fn() -> u64 {
-    return ticks_ms() / 1000u64;
+pub SqlError :: errors {
+    cannot_open,  // the file could not be opened or created
+    busy,         // another connection holds a lock
+    constraint,   // a UNIQUE, NOT NULL, CHECK or FOREIGN KEY rule refused a change
+    misuse,       // the API was used the wrong way (a statement used after `finish`)
+    failed,       // anything else; `message` says what
 }
 
-#test
-ticks_go_forward :: fn(t: *Test) {
-    a := ticks_ms();
-    b := ticks_ms();
-    t.expect(b >= a);
+pub Db :: struct {
+    handle: usize,
+
+    // Close the database; the statements must be finished before.
+    pub close :: fn(self: *Self) {
+        rc := sqlite3_close_v2(self.handle);
+        self.handle = 0usize;
+    }
+
+    // Run `sql`, one or more statements that return no rows, such as a schema.
+    pub exec :: fn(self: *Self, sql: []const u8) -> void ! SqlError {
+        base: usize = unsafe sql.ptr as usize;
+        at: usize = 0usize;
+        while at < sql.len {
+            st: usize = 0usize;
+            tail: usize = 0usize;
+            start := base + at;
+            rc := sqlite3_prepare_v2(self.handle, unsafe core::ptr_from_int([*]const u8, start), (sql.len - at) as i32, &st, &tail);
+            check(rc)?;
+            if st == 0usize { return; }  // only white space or comments were left
+            step := sqlite3_step(st);
+            while step == ROW { step = sqlite3_step(st); }
+            done := sqlite3_finalize(st);
+            if step != DONE { check(step)?; }
+            at = tail - base;
+        }
+    }
+
+    // A statement for `sql` (one statement), to bind, step and finish.
+    pub prepare :: fn(self: *Self, sql: []const u8) -> Stmt ! SqlError {
+        st: usize = 0usize;
+        tail: usize = 0usize;
+        rc := sqlite3_prepare_v2(self.handle, sql.ptr, sql.len as i32, &st, &tail);
+        check(rc)?;
+        if st == 0usize { fail .misuse; }
+        out: Stmt = .{ st };
+        return out;
+    }
+
+    // What went wrong last, in SQLite's words.
+    pub message :: fn(self: *Self) -> []const u8 { return c_text(sqlite3_errmsg(self.handle)); }
+
+    // The rows the last INSERT, UPDATE or DELETE changed.
+    pub changes :: fn(self: *Self) -> i64 { return sqlite3_changes64(self.handle); }
+
+    // The rowid of the last INSERT.
+    pub last_rowid :: fn(self: *Self) -> i64 { return sqlite3_last_insert_rowid(self.handle); }
+
+    // Wait up to `ms` milliseconds for a lock before a statement fails with `busy`.
+    pub wait_for_locks :: fn(self: *Self, ms: i32) { rc := sqlite3_busy_timeout(self.handle, ms); }
 }
 
-#test
-has_a_process_id :: fn(t: *Test) {
-    t.expect(process_id() != 0u32);
+pub Stmt :: struct {
+    handle: usize,
+
+    pub bind_int :: fn(self: *Self, param: i32, value: i64) -> void ! SqlError {
+        check(sqlite3_bind_int64(self.handle, param, value))?;
+    }
+
+    pub bind_float :: fn(self: *Self, param: i32, value: f64) -> void ! SqlError {
+        check(sqlite3_bind_double(self.handle, param, value))?;
+    }
+
+    // SQLite keeps a copy of `value`.
+    pub bind_text :: fn(self: *Self, param: i32, value: []const u8) -> void ! SqlError {
+        check(sqlite3_bind_text(self.handle, param, value.ptr, value.len as i32, TRANSIENT))?;
+    }
+
+    pub bind_null :: fn(self: *Self, param: i32) -> void ! SqlError {
+        check(sqlite3_bind_null(self.handle, param))?;
+    }
+
+    // Run to the next row: true when one is there to read, false when the statement is done.
+    pub step :: fn(self: *Self) -> bool ! SqlError {
+        rc := sqlite3_step(self.handle);
+        if rc == ROW { return true; }
+        if rc == DONE { return false; }
+        check(rc)?;
+        return false;
+    }
+
+    pub columns :: fn(self: *Self) -> i32 { return sqlite3_column_count(self.handle); }
+
+    pub int :: fn(self: *Self, col: i32) -> i64 { return sqlite3_column_int64(self.handle, col); }
+
+    pub float :: fn(self: *Self, col: i32) -> f64 { return sqlite3_column_double(self.handle, col); }
+
+    // The text of `col` in this row, empty for NULL. Valid until the next step, reset or finish.
+    pub text :: fn(self: *Self, col: i32) -> []const u8 {
+        p := sqlite3_column_text(self.handle, col);
+        n := sqlite3_column_bytes(self.handle, col);
+        if p == 0usize || n <= 0 { return ""; }
+        return unsafe core::slice_from_raw_parts(u8, core::ptr_from_int([*]const u8, p), n as usize);
+    }
+
+    pub is_null :: fn(self: *Self, col: i32) -> bool { return sqlite3_column_type(self.handle, col) == NULL_TYPE; }
+
+    // Back to the start, to step again; the bound values stay.
+    pub reset :: fn(self: *Self) -> void ! SqlError { check(sqlite3_reset(self.handle))?; }
+
+    // Free the statement.
+    pub finish :: fn(self: *Self) {
+        rc := sqlite3_finalize(self.handle);
+        self.handle = 0usize;
+    }
 }
+
+// Open the database file at `path`, creating it when it is not there. ":memory:" is a
+// database that lives only as long as it is open.
+pub open :: fn(path: []const u8) -> Db ! SqlError { return open_with(path, OPEN_READWRITE | OPEN_CREATE); }
+
+// Open an existing database file only to read it.
+pub open_read_only :: fn(path: []const u8) -> Db ! SqlError { return open_with(path, OPEN_READONLY); }
+
+// The version of the SQLite library, "3.54.0".
+pub version :: fn() -> []const u8 { return c_text(sqlite3_libversion()); }
+
+// Inside
+
+OK :: 0;
+ROW :: 100;
+DONE :: 101;
+NULL_TYPE :: 5;
+OPEN_READONLY :: 1;
+OPEN_READWRITE :: 2;
+OPEN_CREATE :: 4;
+OPEN_FULLMUTEX :: 65536;
+// SQLITE_TRANSIENT: SQLite copies the bound text.
+TRANSIENT :: -1isize;
+
+open_with :: fn(path: []const u8, flags: i32) -> Db ! SqlError {
+    name: [1024]u8 = .{};
+    if path.len + 1usize > name.len { fail .cannot_open; }
+    i: usize = 0usize;
+    while i < path.len {
+        name[i] = path[i];
+        i += 1usize;
+    }
+    name[path.len] = 0u8;
+    handle: usize = 0usize;
+    rc := sqlite3_open_v2(&name[0], &handle, flags | OPEN_FULLMUTEX, 0usize);
+    if rc != OK {
+        if handle != 0usize { closed := sqlite3_close_v2(handle); }
+        fail .cannot_open;
+    }
+    out: Db = .{ handle };
+    return out;
+}
+
+// Fail with the error a SQLite result code stands for; OK passes.
+check :: fn(rc: i32) -> void ! SqlError {
+    if rc == OK { return; }
+    // the primary code is the low byte of an extended one
+    match rc & 255 {
+        5, 6 => { fail .busy; }
+        14 => { fail .cannot_open; }
+        19 => { fail .constraint; }
+        21 => { fail .misuse; }
+        else => { fail .failed; }
+    }
+}
+
+// A NUL-terminated C text as a slice.
+c_text :: fn(p: [*]const u8) -> []const u8 {
+    n: usize = 0usize;
+    while p[n] != 0u8 { n += 1usize; }
+    return unsafe core::slice_from_raw_parts(u8, p, n);
+}
+
+// The bindings
+
+#extern("sqlite3", "sqlite3_open_v2")
+sqlite3_open_v2 :: fn(filename: *u8, db: *usize, flags: i32, vfs: usize) -> i32;
+#extern("sqlite3", "sqlite3_close_v2")
+sqlite3_close_v2 :: fn(db: usize) -> i32;
+#extern("sqlite3", "sqlite3_errmsg")
+sqlite3_errmsg :: fn(db: usize) -> [*]const u8;
+#extern("sqlite3", "sqlite3_libversion")
+sqlite3_libversion :: fn() -> [*]const u8;
+#extern("sqlite3", "sqlite3_prepare_v2")
+sqlite3_prepare_v2 :: fn(db: usize, sql: [*]const u8, nbyte: i32, stmt: *usize, tail: *usize) -> i32;
+#extern("sqlite3", "sqlite3_step")
+sqlite3_step :: fn(stmt: usize) -> i32;
+#extern("sqlite3", "sqlite3_reset")
+sqlite3_reset :: fn(stmt: usize) -> i32;
+#extern("sqlite3", "sqlite3_finalize")
+sqlite3_finalize :: fn(stmt: usize) -> i32;
+#extern("sqlite3", "sqlite3_bind_int64")
+sqlite3_bind_int64 :: fn(stmt: usize, param: i32, value: i64) -> i32;
+#extern("sqlite3", "sqlite3_bind_double")
+sqlite3_bind_double :: fn(stmt: usize, param: i32, value: f64) -> i32;
+#extern("sqlite3", "sqlite3_bind_text")
+sqlite3_bind_text :: fn(stmt: usize, param: i32, text: [*]const u8, n: i32, destructor: isize) -> i32;
+#extern("sqlite3", "sqlite3_bind_null")
+sqlite3_bind_null :: fn(stmt: usize, param: i32) -> i32;
+#extern("sqlite3", "sqlite3_column_count")
+sqlite3_column_count :: fn(stmt: usize) -> i32;
+#extern("sqlite3", "sqlite3_column_type")
+sqlite3_column_type :: fn(stmt: usize, col: i32) -> i32;
+#extern("sqlite3", "sqlite3_column_int64")
+sqlite3_column_int64 :: fn(stmt: usize, col: i32) -> i64;
+#extern("sqlite3", "sqlite3_column_double")
+sqlite3_column_double :: fn(stmt: usize, col: i32) -> f64;
+#extern("sqlite3", "sqlite3_column_text")
+sqlite3_column_text :: fn(stmt: usize, col: i32) -> usize;
+#extern("sqlite3", "sqlite3_column_bytes")
+sqlite3_column_bytes :: fn(stmt: usize, col: i32) -> i32;
+#extern("sqlite3", "sqlite3_changes64")
+sqlite3_changes64 :: fn(db: usize) -> i64;
+#extern("sqlite3", "sqlite3_last_insert_rowid")
+sqlite3_last_insert_rowid :: fn(db: usize) -> i64;
+#extern("sqlite3", "sqlite3_busy_timeout")
+sqlite3_busy_timeout :: fn(db: usize, ms: i32) -> i32;
