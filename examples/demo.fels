@@ -1,0 +1,9 @@
+#import std.io;
+#import sqlite;
+
+main :: fn() -> i32 {
+    io::print("seconds since boot: ");
+    io::print_u64(sqlite::seconds_since_boot());
+    io::println("");
+    return 0;
+}
