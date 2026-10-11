@@ -1,0 +1,97 @@
+// The tests of sqlite, in their own file so a program that imports sqlite does not run them
+// when it builds. They call the SQLite library, so they run as a test program (`fels test`).
+#import sqlite;
+#import sqlite.{ Db, Stmt };
+
+memory :: fn(t: *Test) -> Db {
+    db := sqlite::open(":memory:") catch err {
+        t.fatal("cannot open an in-memory database");
+        out: Db = .{ 0usize };
+        return out;
+    };
+    return db;
+}
+
+#test
+the_library_has_a_version :: fn(t: *Test) {
+    v := sqlite::version();
+    t.expect(v.len >= 5usize);
+    t.eq(v[0], 51u8);  // "3"
+}
+
+#test
+rows_go_in_and_come_out :: fn(t: *Test) {
+    db := memory(t);
+    db.exec("CREATE TABLE notes (id INTEGER PRIMARY KEY, text TEXT NOT NULL, amount REAL);
+             INSERT INTO notes (text, amount) VALUES ('first', 1.5);") catch err { t.fatal("exec failed"); };
+    st := db.prepare("INSERT INTO notes (text, amount) VALUES (?1, ?2);") catch err { t.fatal("prepare failed"); return; };
+    st.bind_text(1, "Grüße") catch err { t.fatal("bind failed"); };
+    st.bind_float(2, 2.25) catch err { t.fatal("bind failed"); };
+    more := st.step() catch err { t.fatal("step failed"); return; };
+    t.expect(!more);
+    st.finish();
+    t.eq(db.last_rowid(), 2i64);
+    t.eq(db.changes(), 1i64);
+
+    q := db.prepare("SELECT id, text, amount FROM notes ORDER BY id;") catch err { t.fatal("prepare failed"); return; };
+    t.eq(q.columns(), 3);
+    t.expect(q.step() ?? false);
+    t.eq(q.int(0), 1i64);
+    t.eq(q.text(1), "first");
+    t.expect(q.float(2) == 1.5);
+    t.expect(q.step() ?? false);
+    t.eq(q.text(1), "Grüße");
+    t.expect(!(q.step() ?? true));
+    q.finish();
+    db.close();
+}
+
+#test
+a_null_and_a_reset :: fn(t: *Test) {
+    db := memory(t);
+    db.exec("CREATE TABLE t (v INTEGER);") catch err { t.fatal("exec failed"); };
+    ins := db.prepare("INSERT INTO t (v) VALUES (?1);") catch err { t.fatal("prepare failed"); return; };
+    ins.bind_null(1) catch err { t.fatal("bind failed"); };
+    done := ins.step() ?? true;
+    ins.reset() catch err { t.fatal("reset failed"); };
+    ins.bind_int(1, 42i64) catch err { t.fatal("bind failed"); };
+    done = ins.step() ?? true;
+    ins.finish();
+    q := db.prepare("SELECT v FROM t ORDER BY rowid;") catch err { t.fatal("prepare failed"); return; };
+    t.expect(q.step() ?? false);
+    t.expect(q.is_null(0));
+    t.eq(q.text(0), "");
+    t.expect(q.step() ?? false);
+    t.eq(q.int(0), 42i64);
+    q.finish();
+    db.close();
+}
+
+#test
+mistakes_are_errors :: fn(t: *Test) {
+    db := memory(t);
+    db.exec("CREATE TABLE u (name TEXT UNIQUE NOT NULL);") catch err { t.fatal("exec failed"); };
+    db.exec("INSERT INTO u VALUES ('a');") catch err { t.fatal("exec failed"); };
+    refused := false;
+    db.exec("INSERT INTO u VALUES ('a');") catch err { refused = err == .constraint; };
+    t.expect(refused);
+    bad := false;
+    st := db.prepare("SELEKT nothing;") catch err {
+        bad = err == .failed;
+        t.expect(db.message().len > 0usize);
+        db.close();
+        return;
+    };
+    t.fatal("a statement that is no SQL was prepared");
+}
+
+#test
+a_file_that_cannot_be_opened :: fn(t: *Test) {
+    refused := false;
+    db := sqlite::open_read_only("no/such/folder/x.db") catch err {
+        refused = err == .cannot_open;
+        t.expect(refused);
+        return;
+    };
+    t.fatal("a missing file was opened");
+}
