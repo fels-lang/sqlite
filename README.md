@@ -17,7 +17,7 @@
 ## Use it
 
 ```
-fels add sqlite github.com/<you>/sqlite
+fels add sqlite github.com/fels-lang/sqlite
 ```
 
 ```fels
